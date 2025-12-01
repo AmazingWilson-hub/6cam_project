@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>6-Camera Extrinsic Calibration</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #1a1a1a;
+            color: #e0e0e0;
+        }
+
+        .canvas-container {
+            position: relative;
+            width: 100%;
+            height: 0;
+            padding-bottom: 66.66%;
+            overflow: hidden;
+            background: #000;
+        }
+
+        .canvas-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        .img-bg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        const PORTS = ["port_1", "port_2", "port_3", "port_5", "port_6", "port_7"];
+        const PORT_NAMES = {
+            "port_1": "Front (1)",
+            "port_2": "Front Left (2)",
+            "port_3": "Rear Left (3)",
+            "port_5": "Front Right (5)",
+            "port_6": "Rear Right (6)",
+            "port_7": "Rear (7)"
+        };
+
+        // Math Utils
+        function toRadians(deg) { return deg * Math.PI / 180; }
+
+        function getRotationMatrix(roll, pitch, yaw) {
+            const r = toRadians(roll);
+            const p = toRadians(pitch);
+            const y = toRadians(yaw);
+
+            const cx = Math.cos(r), sx = Math.sin(r);
+            const cy = Math.cos(p), sy = Math.sin(p);
+            const cz = Math.cos(y), sz = Math.sin(y);
+
+            // Rz * Ry * Rx
+            const Rz = [
+                [cz, -sz, 0],
+                [sz, cz, 0],
+                [0, 0, 1]
+            ];
+            const Ry = [
+                [cy, 0, sy],
+                [0, 1, 0],
+                [-sy, 0, cy]
+            ];
+            const Rx = [
+                [1, 0, 0],
+                [0, cx, -sx],
+                [0, sx, cx]
+            ];
+
+            // R = Rz * Ry * Rx
+            // Let's multiply manually or just chain
+            // Ry * Rx
+            const RyRx = [
+                [cy, sy * sx, sy * cx],
+                [0, cx, -sx],
+                [-sy, cy * sx, cy * cx]
+            ];
+
+            // Rz * (Ry * Rx)
+            const R = [
+                [
+                    cz * RyRx[0][0] + -sz * RyRx[1][0] + 0 * RyRx[2][0],
+                    cz * RyRx[0][1] + -sz * RyRx[1][1] + 0 * RyRx[2][1],
+                    cz * RyRx[0][2] + -sz * RyRx[1][2] + 0 * RyRx[2][2]
+                ],
+                [
+                    sz * RyRx[0][0] + cz * RyRx[1][0] + 0 * RyRx[2][0],
+                    sz * RyRx[0][1] + cz * RyRx[1][1] + 0 * RyRx[2][1],
+                    sz * RyRx[0][2] + cz * RyRx[1][2] + 0 * RyRx[2][2]
+                ],
+                [
+                    0 * RyRx[0][0] + 0 * RyRx[1][0] + 1 * RyRx[2][0],
+                    0 * RyRx[0][1] + 0 * RyRx[1][1] + 1 * RyRx[2][1],
+                    0 * RyRx[0][2] + 0 * RyRx[1][2] + 1 * RyRx[2][2]
+                ]
+            ];
+            return R;
+        }
+
+        function projectPoint(point, R, t, K, dist) {
+            // point: [x, y, z]
+            // P_cam = R * P_lidar + t
+            const x = R[0][0] * point[0] + R[0][1] * point[1] + R[0][2] * point[2] + t[0];
+            const y = R[1][0] * point[0] + R[1][1] * point[1] + R[1][2] * point[2] + t[1];
+            const z = R[2][0] * point[0] + R[2][1] * point[1] + R[2][2] * point[2] + t[2];
+
+            if (z < 0.1) return null; // Behind camera
+
+            // Normalize
+            const x_n = x / z;
+            const y_n = y / z;
+
+            // Distortion (Simple Radial k1, k2) - ignoring p1, p2, k3 for speed/simplicity unless needed
+            // If distortion is 0, skip
+            const r2 = x_n * x_n + y_n * y_n;
+            const k1 = dist.k1 || 0;
+            const k2 = dist.k2 || 0;
+            const radial = 1 + k1 * r2 + k2 * r2 * r2;
+
+            const x_d = x_n * radial;
+            const y_d = y_n * radial;
+
+            // Project to pixel
+            const u = K.fx * x_d + K.cx;
+            const v = K.fy * y_d + K.cy;
+
+            return [u, v];
+        }
+
+        function App() {
+            const [frames, setFrames] = useState([]);
+            const [currentFrame, setCurrentFrame] = useState("");
+            const [config, setConfig] = useState(null);
+            const [selectedPort, setSelectedPort] = useState("port_1");
+            const [points3D, setPoints3D] = useState([]); // Raw 3D points
+            const [showPoints, setShowPoints] = useState(true);
+
+            // Canvas refs
+            const canvasRefs = useRef({});
+
+            useEffect(() => {
+                fetch('/api/frames').then(res => res.json()).then(data => {
+                    setFrames(data);
+                    if (data.length > 0) setCurrentFrame(data[0]);
+                });
+                fetch('/api/config').then(res => res.json()).then(setConfig);
+            }, []);
+
+            useEffect(() => {
+                if (currentFrame) {
+                    setPoints3D([]); // Clear old points
+                    fetch(`/api/points/${currentFrame}`)
+                        .then(res => res.json())
+                        .then(data => setPoints3D(data.points));
+                }
+            }, [currentFrame]);
+
+            // Render loop
+            useEffect(() => {
+                if (!config || points3D.length === 0 || !showPoints) {
+                    // Clear canvases if needed
+                    PORTS.forEach(port => {
+                        const canvas = canvasRefs.current[port];
+                        if (canvas) {
+                            const ctx = canvas.getContext('2d');
+                            ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        }
+                    });
+                    return;
+                }
+
+                PORTS.forEach(port => {
+                    const canvas = canvasRefs.current[port];
+                    if (!canvas) return;
+
+                    const ctx = canvas.getContext('2d');
+                    // Resize canvas to match display size
+                    if (canvas.width !== canvas.offsetWidth || canvas.height !== canvas.offsetHeight) {
+                        canvas.width = canvas.offsetWidth;
+                        canvas.height = canvas.offsetHeight;
+                    }
+
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                    // Optimization: Only render selected port? 
+                    // Or render all but maybe less frequently?
+                    // Let's try rendering all. 30k points * 6 cameras = 180k projections. 
+                    // Might be heavy for JS.
+                    // Let's only render the SELECTED port fully, and others maybe simplified or skip?
+                    // User wants to calibrate one by one usually.
+                    // But seeing all is nice.
+
+                    // Let's render ALL. If slow, we can optimize.
+
+                    const camConfig = config.cameras[port];
+                    const R = getRotationMatrix(camConfig.extrinsic.roll, camConfig.extrinsic.pitch, camConfig.extrinsic.yaw);
+                    const t = [camConfig.extrinsic.x, camConfig.extrinsic.y, camConfig.extrinsic.z];
+                    const K = camConfig.intrinsic;
+                    const dist = camConfig.intrinsic; // contains k1, k2
+
+                    // Scale factors
+                    // Assuming intrinsic is for full resolution (e.g. 1920x1280)
+                    // We need to know the original image size to scale correctly.
+                    // Let's assume 1920x1280 for now as per plan.
+                    const scaleX = canvas.width / 1920;
+                    const scaleY = canvas.height / 1280;
+
+                    ctx.fillStyle = 'red';
+                    // Batch drawing?
+                    // ctx.beginPath();
+                    for (let i = 0; i < points3D.length; i++) {
+                        const pt = points3D[i];
+                        // Calculate Z in camera frame for depth
+                        // P_cam = R * P_lidar + t
+                        const z = R[2][0] * pt[0] + R[2][1] * pt[1] + R[2][2] * pt[2] + t[2];
+
+                        if (z < 0.1) continue;
+
+                        const uv = projectPoint(pt, R, t, K, dist);
+                        if (uv) {
+                            const u = uv[0] * scaleX;
+                            const v = uv[1] * scaleY;
+
+                            // Check bounds
+                            if (u >= 0 && u < canvas.width && v >= 0 && v < canvas.height) {
+                                // Color based on depth (z)
+                                // Map 1m -> 0 (Red), 50m -> 240 (Blue)
+                                const minDepth = 1.0;
+                                const maxDepth = 50.0;
+                                let hue = (Math.max(minDepth, Math.min(z, maxDepth)) - minDepth) / (maxDepth - minDepth) * 240;
+                                // Invert so close is red (0), far is blue (240) -> Actually standard heatmap is usually Blue(far) to Red(close)? 
+                                // Or Red(close) to Blue(far)?
+                                // Let's do Red (close) -> Green -> Blue (far)
+                                // 0 -> 240
+
+                                ctx.fillStyle = `hsl(${240 - hue}, 100%, 50%)`; // Close=Blue(240), Far=Red(0)? No wait.
+                                // Let's do: Close = Red (0), Far = Blue (240)
+                                // hue = 0 (Red) at minDepth
+                                // hue = 240 (Blue) at maxDepth
+                                ctx.fillStyle = `hsl(${hue}, 100%, 50%)`;
+
+                                ctx.fillRect(u, v, 2, 2);
+                            }
+                        }
+                    }
+                });
+
+            }, [config, points3D, showPoints, selectedPort]); // Re-render when config changes
+
+            const handleConfigChange = (port, key, value) => {
+                const newConfig = { ...config };
+                newConfig.cameras[port].extrinsic[key] = parseFloat(value);
+                setConfig(newConfig);
+            };
+
+            const saveConfig = () => {
+                fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                }).then(() => alert("Saved!"));
+            };
+
+            if (!config) return <div>Loading config...</div>;
+
+            return (
+                <div className="flex h-screen flex-col">
+                    <div className="bg-gray-800 p-4 flex items-center gap-4">
+                        <h1 className="text-xl font-bold">Calibration Tool (Fast)</h1>
+                        <select className="bg-gray-700 p-2 rounded" value={currentFrame} onChange={e => setCurrentFrame(e.target.value)}>
+                            {frames.map(f => <option key={f} value={f}>{f}</option>)}
+                        </select>
+                        <button className="bg-blue-600 px-4 py-2 rounded" onClick={saveConfig}>Save Config</button>
+                        <label className="flex items-center gap-2">
+                            <input type="checkbox" checked={showPoints} onChange={e => setShowPoints(e.target.checked)} />
+                            Show LiDAR
+                        </label>
+                    </div>
+
+                    <div className="flex flex-1 overflow-hidden">
+                        {/* Main View (Grid) */}
+                        <div className="flex-1 overflow-y-auto p-4 grid grid-cols-3 gap-4">
+                            {PORTS.map(port => (
+                                <div key={port}
+                                    className={`border-2 ${selectedPort === port ? 'border-blue-500' : 'border-gray-700'} rounded overflow-hidden cursor-pointer relative`}
+                                    onClick={() => setSelectedPort(port)}>
+                                    <div className="absolute top-0 left-0 bg-black/50 px-2 py-1 z-10">{PORT_NAMES[port]}</div>
+                                    <div className="canvas-container">
+                                        <img src={`/api/image/${port}/${currentFrame}`} className="img-bg" />
+                                        <canvas
+                                            className="canvas-overlay"
+                                            ref={el => canvasRefs.current[port] = el}
+                                        />
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+
+                        {/* Controls */}
+                        <div className="w-80 bg-gray-900 p-4 overflow-y-auto border-l border-gray-700">
+                            <h2 className="text-lg font-bold mb-4">Adjust {PORT_NAMES[selectedPort]}</h2>
+
+                            <div className="space-y-4">
+                                {['x', 'y', 'z', 'roll', 'pitch', 'yaw'].map(param => (
+                                    <div key={param}>
+                                        <div className="flex justify-between text-sm">
+                                            <span>{param.toUpperCase()}</span>
+                                            <span>{config.cameras[selectedPort].extrinsic[param].toFixed(3)}</span>
+                                        </div>
+                                        <input
+                                            type="range"
+                                            min={['roll', 'pitch', 'yaw'].includes(param) ? -180 : -5}
+                                            max={['roll', 'pitch', 'yaw'].includes(param) ? 180 : 5}
+                                            step={['roll', 'pitch', 'yaw'].includes(param) ? 0.1 : 0.01}
+                                            value={config.cameras[selectedPort].extrinsic[param]}
+                                            onChange={e => handleConfigChange(selectedPort, param, e.target.value)}
+                                            className="w-full"
+                                        />
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div className="mt-8">
+                                <h3 className="font-bold mb-2">Intrinsics (Read-only)</h3>
+                                <pre className="text-xs bg-gray-800 p-2 rounded">
+                                    {JSON.stringify(config.cameras[selectedPort].intrinsic, null, 2)}
+                                </pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>
